@@ -1,11 +1,13 @@
 """Telegram channel implementation using python-telegram-bot."""
 
+from __future__ import annotations
+
 import asyncio
 import re
-
 from loguru import logger
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import BotCommand, Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -76,6 +78,26 @@ def _markdown_to_telegram_html(text: str) -> str:
     return text
 
 
+def _split_message(content: str, max_len: int = 4000) -> list[str]:
+    """Split content into chunks within max_len, preferring line breaks."""
+    if len(content) <= max_len:
+        return [content]
+    chunks: list[str] = []
+    while content:
+        if len(content) <= max_len:
+            chunks.append(content)
+            break
+        cut = content[:max_len]
+        pos = cut.rfind('\n')
+        if pos == -1:
+            pos = cut.rfind(' ')
+        if pos == -1:
+            pos = max_len
+        chunks.append(content[:pos])
+        content = content[pos:].lstrip()
+    return chunks
+
+
 class TelegramChannel(BaseChannel):
     """
     Telegram channel using long polling.
@@ -85,12 +107,25 @@ class TelegramChannel(BaseChannel):
     
     name = "telegram"
     
-    def __init__(self, config: TelegramConfig, bus: MessageBus, groq_api_key: str = ""):
+    # Commands registered with Telegram's command menu
+    BOT_COMMANDS = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("new", "Start a new conversation"),
+        BotCommand("help", "Show available commands"),
+    ]
+    
+    def __init__(
+        self,
+        config: TelegramConfig,
+        bus: MessageBus,
+        groq_api_key: str = "",
+    ):
         super().__init__(config, bus)
         self.config: TelegramConfig = config
         self.groq_api_key = groq_api_key
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
+        self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -100,11 +135,18 @@ class TelegramChannel(BaseChannel):
         
         self._running = True
         
-        # Build the application
-        builder = Application.builder().token(self.config.token)
+        # Build the application with larger connection pool to avoid pool-timeout on long runs
+        req = HTTPXRequest(connection_pool_size=16, pool_timeout=5.0, connect_timeout=30.0, read_timeout=30.0)
+        builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
         if self.config.proxy:
             builder = builder.proxy(self.config.proxy).get_updates_proxy(self.config.proxy)
         self._app = builder.build()
+        self._app.add_error_handler(self._on_error)
+        
+        # Add command handlers
+        self._app.add_handler(CommandHandler("start", self._on_start))
+        self._app.add_handler(CommandHandler("new", self._forward_command))
+        self._app.add_handler(CommandHandler("help", self._forward_command))
         
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -115,19 +157,21 @@ class TelegramChannel(BaseChannel):
             )
         )
         
-        # Add /start command handler
-        from telegram.ext import CommandHandler
-        self._app.add_handler(CommandHandler("start", self._on_start))
-        
         logger.info("Starting Telegram bot (polling mode)...")
         
         # Initialize and start polling
         await self._app.initialize()
         await self._app.start()
         
-        # Get bot info
+        # Get bot info and register command menu
         bot_info = await self._app.bot.get_me()
         logger.info(f"Telegram bot @{bot_info.username} connected")
+        
+        try:
+            await self._app.bot.set_my_commands(self.BOT_COMMANDS)
+            logger.debug("Telegram bot commands registered")
+        except Exception as e:
+            logger.warning(f"Failed to register bot commands: {e}")
         
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
@@ -143,6 +187,10 @@ class TelegramChannel(BaseChannel):
         """Stop the Telegram bot."""
         self._running = False
         
+        # Cancel all typing indicators
+        for chat_id in list(self._typing_tasks):
+            self._stop_typing(chat_id)
+        
         if self._app:
             logger.info("Stopping Telegram bot...")
             await self._app.updater.stop()
@@ -150,34 +198,61 @@ class TelegramChannel(BaseChannel):
             await self._app.shutdown()
             self._app = None
     
+    @staticmethod
+    def _get_media_type(path: str) -> str:
+        """Guess media type from file extension."""
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if ext in ("jpg", "jpeg", "png", "gif", "webp"):
+            return "photo"
+        if ext == "ogg":
+            return "voice"
+        if ext in ("mp3", "m4a", "wav", "aac"):
+            return "audio"
+        return "document"
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Telegram."""
         if not self._app:
             logger.warning("Telegram bot not running")
             return
-        
+
+        self._stop_typing(msg.chat_id)
+
         try:
-            # chat_id should be the Telegram chat ID (integer)
             chat_id = int(msg.chat_id)
-            # Convert markdown to Telegram HTML
-            html_content = _markdown_to_telegram_html(msg.content)
-            await self._app.bot.send_message(
-                chat_id=chat_id,
-                text=html_content,
-                parse_mode="HTML"
-            )
         except ValueError:
             logger.error(f"Invalid chat_id: {msg.chat_id}")
-        except Exception as e:
-            # Fallback to plain text if HTML parsing fails
-            logger.warning(f"HTML parse failed, falling back to plain text: {e}")
+            return
+
+        # Send media files
+        for media_path in (msg.media or []):
             try:
-                await self._app.bot.send_message(
-                    chat_id=int(msg.chat_id),
-                    text=msg.content
-                )
-            except Exception as e2:
-                logger.error(f"Error sending Telegram message: {e2}")
+                media_type = self._get_media_type(media_path)
+                sender = {
+                    "photo": self._app.bot.send_photo,
+                    "voice": self._app.bot.send_voice,
+                    "audio": self._app.bot.send_audio,
+                }.get(media_type, self._app.bot.send_document)
+                param = "photo" if media_type == "photo" else media_type if media_type in ("voice", "audio") else "document"
+                with open(media_path, 'rb') as f:
+                    await sender(chat_id=chat_id, **{param: f})
+            except Exception as e:
+                filename = media_path.rsplit("/", 1)[-1]
+                logger.error(f"Failed to send media {media_path}: {e}")
+                await self._app.bot.send_message(chat_id=chat_id, text=f"[Failed to send: {filename}]")
+
+        # Send text content
+        if msg.content and msg.content != "[empty message]":
+            for chunk in _split_message(msg.content):
+                try:
+                    html = _markdown_to_telegram_html(chunk)
+                    await self._app.bot.send_message(chat_id=chat_id, text=html, parse_mode="HTML")
+                except Exception as e:
+                    logger.warning(f"HTML parse failed, falling back to plain text: {e}")
+                    try:
+                        await self._app.bot.send_message(chat_id=chat_id, text=chunk)
+                    except Exception as e2:
+                        logger.error(f"Error sending Telegram message: {e2}")
     
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
@@ -187,7 +262,24 @@ class TelegramChannel(BaseChannel):
         user = update.effective_user
         await update.message.reply_text(
             f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
-            "Send me a message and I'll respond!"
+            "Send me a message and I'll respond!\n"
+            "Type /help to see available commands."
+        )
+    
+    @staticmethod
+    def _sender_id(user) -> str:
+        """Build sender_id with username for allowlist matching."""
+        sid = str(user.id)
+        return f"{sid}|{user.username}" if user.username else sid
+
+    async def _forward_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Forward slash commands to the bus for unified handling in AgentLoop."""
+        if not update.message or not update.effective_user:
+            return
+        await self._handle_message(
+            sender_id=self._sender_id(update.effective_user),
+            chat_id=str(update.message.chat_id),
+            content=update.message.text,
         )
     
     async def _on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,11 +290,7 @@ class TelegramChannel(BaseChannel):
         message = update.message
         user = update.effective_user
         chat_id = message.chat_id
-        
-        # Use stable numeric ID, but keep username for allowlist compatibility
-        sender_id = str(user.id)
-        if user.username:
-            sender_id = f"{sender_id}|{user.username}"
+        sender_id = self._sender_id(user)
         
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
@@ -272,10 +360,15 @@ class TelegramChannel(BaseChannel):
         
         logger.debug(f"Telegram message from {sender_id}: {content[:50]}...")
         
+        str_chat_id = str(chat_id)
+        
+        # Start typing indicator before processing
+        self._start_typing(str_chat_id)
+        
         # Forward to the message bus
         await self._handle_message(
             sender_id=sender_id,
-            chat_id=str(chat_id),
+            chat_id=str_chat_id,
             content=content,
             media=media_paths,
             metadata={
@@ -287,6 +380,33 @@ class TelegramChannel(BaseChannel):
             }
         )
     
+    def _start_typing(self, chat_id: str) -> None:
+        """Start sending 'typing...' indicator for a chat."""
+        # Cancel any existing typing task for this chat
+        self._stop_typing(chat_id)
+        self._typing_tasks[chat_id] = asyncio.create_task(self._typing_loop(chat_id))
+    
+    def _stop_typing(self, chat_id: str) -> None:
+        """Stop the typing indicator for a chat."""
+        task = self._typing_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+    
+    async def _typing_loop(self, chat_id: str) -> None:
+        """Repeatedly send 'typing' action until cancelled."""
+        try:
+            while self._app:
+                await self._app.bot.send_chat_action(chat_id=int(chat_id), action="typing")
+                await asyncio.sleep(4)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Typing indicator stopped for {chat_id}: {e}")
+    
+    async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Log polling / handler errors instead of silently swallowing them."""
+        logger.error(f"Telegram error: {context.error}")
+
     def _get_extension(self, media_type: str, mime_type: str | None) -> str:
         """Get file extension based on media type."""
         if mime_type:
