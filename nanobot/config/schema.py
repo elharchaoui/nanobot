@@ -236,7 +236,9 @@ class GatewayConfig(Base):
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
-    api_key: str = ""  # Brave Search API key
+    provider: str = "brave"  # Search provider: "brave" or "exa"
+    api_key: str = ""        # Brave Search API key (or set BRAVE_API_KEY env var)
+    exa_api_key: str = ""    # Exa Search API key (or set EXA_API_KEY env var)
     max_results: int = 5
 
 
