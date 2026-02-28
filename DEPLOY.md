@@ -120,7 +120,9 @@ pip install 'nanobot-ai[mem0]'
 }
 ```
 
-Both API keys can be the same OpenRouter key. On first start you should see in the logs:
+Both API keys can be the same OpenRouter key. **Important:** the `llmModel` must support structured JSON output — `openai/gpt-4o-mini` is recommended. Smaller models (e.g. llama-3.1-8b) silently fail fact extraction.
+
+On first start you should see in the logs:
 ```
 Mem0 initialized (chroma at ~/.nanobot/workspace/memory/chroma)
 ```
