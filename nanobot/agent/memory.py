@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -11,9 +12,12 @@ from loguru import logger
 from nanobot.utils.helpers import ensure_dir
 
 if TYPE_CHECKING:
+    from nanobot.config.schema import Mem0Config
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import Session
 
+
+_MEM0_USER = "owner"
 
 _SAVE_MEMORY_TOOL = [
     {
@@ -43,12 +47,73 @@ _SAVE_MEMORY_TOOL = [
 
 
 class MemoryStore:
-    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
+    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log).
 
-    def __init__(self, workspace: Path):
+    When mem0_config.enabled is True, conversation facts are automatically extracted
+    and stored in a local ChromaDB via Mem0, and retrieved semantically per query.
+    MEMORY.md is kept for manually-pinned facts written directly by the agent.
+    HISTORY.md is always maintained as a grep-searchable timestamped log.
+    """
+
+    def __init__(self, workspace: Path, mem0_config: "Mem0Config | None" = None):
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
+        self._mem0_config = mem0_config
+        self._mem0 = None  # lazy-initialized
+
+    # ── Mem0 helpers ────────────────────────────────────────────────────────────
+
+    def _get_mem0(self):
+        """Lazy-initialize and return the Mem0 client, or None if disabled/unavailable."""
+        if self._mem0 is not None:
+            return self._mem0
+        if not self._mem0_config or not self._mem0_config.enabled:
+            return None
+        try:
+            from mem0 import Memory  # type: ignore[import]
+            self._mem0 = Memory.from_config(self._build_mem0_config())
+            logger.info("Mem0 initialized (chroma at {})", self.memory_dir / "chroma")
+            return self._mem0
+        except ImportError:
+            logger.warning("mem0ai is not installed — run: pip install 'nanobot-ai[mem0]'")
+            return None
+        except Exception:
+            logger.exception("Mem0 initialization failed")
+            return None
+
+    def _build_mem0_config(self) -> dict:
+        c = self._mem0_config
+        cfg: dict = {
+            "vector_store": {
+                "provider": "chroma",
+                "config": {
+                    "collection_name": "nanobot_memories",
+                    "path": str(self.memory_dir / "chroma"),
+                },
+            }
+        }
+        if c.llm_provider:
+            llm_cfg: dict = {}
+            if c.llm_model:
+                llm_cfg["model"] = c.llm_model
+            if c.llm_api_key:
+                llm_cfg["api_key"] = c.llm_api_key
+            if c.llm_base_url:
+                llm_cfg["openai_base_url"] = c.llm_base_url
+            cfg["llm"] = {"provider": c.llm_provider, "config": llm_cfg}
+        if c.embedder_provider:
+            emb_cfg: dict = {}
+            if c.embedder_model:
+                emb_cfg["model"] = c.embedder_model
+            if c.embedder_api_key:
+                emb_cfg["api_key"] = c.embedder_api_key
+            if c.embedder_base_url:
+                emb_cfg["openai_base_url"] = c.embedder_base_url
+            cfg["embedder"] = {"provider": c.embedder_provider, "config": emb_cfg}
+        return cfg
+
+    # ── Core API ─────────────────────────────────────────────────────────────────
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
@@ -62,21 +127,47 @@ class MemoryStore:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
-    def get_memory_context(self) -> str:
+    def get_memory_context(self, query: str = "") -> str:
+        """Return memory context to inject into the system prompt.
+
+        With Mem0: semantically searches for facts relevant to `query`, plus
+        any manually-pinned content from MEMORY.md.
+        Without Mem0: returns full MEMORY.md content (existing behaviour).
+        """
+        mem0 = self._get_mem0()
+        parts = []
+
+        # Manually-pinned facts are always included
         long_term = self.read_long_term()
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+        if long_term:
+            label = "## Pinned Memory" if mem0 else "## Long-term Memory"
+            parts.append(f"{label}\n{long_term}")
+
+        # Semantic recall via Mem0
+        if mem0 and query:
+            try:
+                results = mem0.search(query, user_id=_MEM0_USER, limit=self._mem0_config.search_limit)
+                facts = [r["memory"] for r in results if r.get("memory")]
+                if facts:
+                    parts.append("## Recalled Memories\n" + "\n".join(f"- {f}" for f in facts))
+            except Exception:
+                logger.exception("Mem0 search failed, falling back to pinned memory only")
+
+        return "\n\n".join(parts)
 
     async def consolidate(
         self,
-        session: Session,
-        provider: LLMProvider,
+        session: "Session",
+        provider: "LLMProvider",
         model: str,
         *,
         archive_all: bool = False,
         memory_window: int = 50,
     ) -> bool:
-        """Consolidate old messages into MEMORY.md + HISTORY.md via LLM tool call.
+        """Consolidate old messages into memory storage.
 
+        With Mem0: extracts structured facts into ChromaDB + appends HISTORY.md.
+        Without Mem0: existing LLM-based MEMORY.md + HISTORY.md approach.
         Returns True on success (including no-op), False on failure.
         """
         if archive_all:
@@ -94,6 +185,50 @@ class MemoryStore:
                 return True
             logger.info("Memory consolidation: {} to consolidate, {} keep", len(old_messages), keep_count)
 
+        mem0 = self._get_mem0()
+        if mem0:
+            return await self._consolidate_mem0(session, mem0, old_messages, archive_all, keep_count)
+        return await self._consolidate_llm(session, provider, model, old_messages, archive_all, keep_count)
+
+    # ── Consolidation backends ──────────────────────────────────────────────────
+
+    async def _consolidate_mem0(
+        self, session: "Session", mem0, old_messages: list, archive_all: bool, keep_count: int
+    ) -> bool:
+        """Mem0 path: extract facts into ChromaDB and append a log entry to HISTORY.md."""
+        chat_messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in old_messages
+            if m.get("content") and m.get("role") in ("user", "assistant")
+        ]
+        if chat_messages:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: mem0.add(chat_messages, user_id=_MEM0_USER),
+                )
+                logger.info("Mem0: extracted facts from {} messages", len(chat_messages))
+            except Exception:
+                logger.exception("Mem0 add failed")
+                return False
+
+        # Always keep the grep-searchable history log
+        self._append_history_summary(old_messages)
+
+        session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
+        logger.info("Mem0 consolidation done: last_consolidated={}", session.last_consolidated)
+        return True
+
+    async def _consolidate_llm(
+        self,
+        session: "Session",
+        provider: "LLMProvider",
+        model: str,
+        old_messages: list,
+        archive_all: bool,
+        keep_count: int,
+    ) -> bool:
+        """LLM path (original): summarize into MEMORY.md + HISTORY.md via tool call."""
         lines = []
         for m in old_messages:
             if not m.get("content"):
@@ -125,7 +260,6 @@ class MemoryStore:
                 return False
 
             args = response.tool_calls[0].arguments
-            # Some providers return arguments as a JSON string instead of dict
             if isinstance(args, str):
                 args = json.loads(args)
             if not isinstance(args, dict):
@@ -143,8 +277,24 @@ class MemoryStore:
                     self.write_long_term(update)
 
             session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
-            logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
+            logger.info(
+                "Memory consolidation done: {} messages, last_consolidated={}",
+                len(session.messages), session.last_consolidated,
+            )
             return True
         except Exception:
             logger.exception("Memory consolidation failed")
             return False
+
+    def _append_history_summary(self, messages: list) -> None:
+        """Append a brief timestamped entry to HISTORY.md from a list of messages."""
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        snippets = [
+            m["content"][:80]
+            for m in messages
+            if m.get("role") == "user" and m.get("content")
+        ]
+        topics = "; ".join(snippets[:3])
+        entry = f"[{ts}] Processed {len(messages)} messages. User topics: {topics}"
+        self.append_history(entry)

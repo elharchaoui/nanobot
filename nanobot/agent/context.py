@@ -22,12 +22,12 @@ class ContextBuilder:
     
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, mem0_config=None):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+        self.memory = MemoryStore(workspace, mem0_config=mem0_config)
         self.skills = SkillsLoader(workspace)
     
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(self, skill_names: list[str] | None = None, query: str = "") -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
         
@@ -48,7 +48,7 @@ class ContextBuilder:
             parts.append(bootstrap)
         
         # Memory context
-        memory = self.memory.get_memory_context()
+        memory = self.memory.get_memory_context(query=query)
         if memory:
             parts.append(f"# Memory\n\n{memory}")
         
@@ -158,8 +158,8 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         """
         messages = []
 
-        # System prompt
-        system_prompt = self.build_system_prompt(skill_names)
+        # System prompt — pass current message as query for semantic memory retrieval
+        system_prompt = self.build_system_prompt(skill_names, query=current_message)
         messages.append({"role": "system", "content": system_prompt})
 
         # History

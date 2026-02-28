@@ -181,6 +181,27 @@ class ChannelsConfig(Base):
     qq: QQConfig = Field(default_factory=QQConfig)
 
 
+class Mem0Config(Base):
+    """Mem0 memory backend configuration."""
+
+    enabled: bool = False
+    llm_provider: str = "openai"
+    llm_model: str = ""
+    llm_api_key: str = ""
+    llm_base_url: str = ""   # override base URL (e.g. "https://openrouter.ai/api/v1")
+    embedder_provider: str = "openai"
+    embedder_model: str = "text-embedding-3-small"
+    embedder_api_key: str = ""
+    embedder_base_url: str = ""  # override base URL (e.g. "https://openrouter.ai/api/v1")
+    search_limit: int = 10
+
+
+class MemoryConfig(Base):
+    """Memory system configuration."""
+
+    mem0: Mem0Config = Field(default_factory=Mem0Config)
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -190,6 +211,7 @@ class AgentDefaults(Base):
     temperature: float = 0.1
     max_tool_iterations: int = 40
     memory_window: int = 100
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
 
 class AgentsConfig(Base):

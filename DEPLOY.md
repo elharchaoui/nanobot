@@ -91,7 +91,46 @@ sudo systemctl restart nanobot
 
 ---
 
+## Optional Dependencies
+
+### Mem0 memory backend
+
+Mem0 adds semantic memory — facts are automatically extracted from conversations and retrieved by relevance on each new message.
+
+**Install:**
+```bash
+pip install 'nanobot-ai[mem0]'
+```
+
+**Enable in `~/.nanobot/config.json`:**
+```json
+"memory": {
+  "mem0": {
+    "enabled": true,
+    "llmProvider": "openai",
+    "llmModel": "meta-llama/llama-3.1-8b-instruct",
+    "llmApiKey": "sk-or-...",
+    "llmBaseUrl": "https://openrouter.ai/api/v1",
+    "embedderProvider": "openai",
+    "embedderModel": "openai/text-embedding-3-small",
+    "embedderApiKey": "sk-or-...",
+    "embedderBaseUrl": "https://openrouter.ai/api/v1",
+    "searchLimit": 10
+  }
+}
+```
+
+Both API keys can be the same OpenRouter key. On first start you should see in the logs:
+```
+Mem0 initialized (chroma at ~/.nanobot/workspace/memory/chroma)
+```
+
+Memory is stored locally under `~/.nanobot/workspace/memory/chroma/`. No data leaves your machine except the LLM/embedding API calls.
+
+---
+
 ## Notes
 
 - Config file: `~/.nanobot/config.json`
 - Log file: `~/.nanobot/gateway.log`
+- Mem0 vector store: `~/.nanobot/workspace/memory/chroma/`
