@@ -150,6 +150,7 @@ class MemoryStore:
                 # Mem0 returns {"results": [...]} in newer versions, plain list in older
                 results = raw.get("results", raw) if isinstance(raw, dict) else raw
                 facts = [r["memory"] for r in results if r.get("memory")]
+                logger.info("Mem0 search: query={!r} → {} facts", query[:60], len(facts))
                 if facts:
                     parts.append("## Recalled Memories\n" + "\n".join(f"- {f}" for f in facts))
             except Exception:
