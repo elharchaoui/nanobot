@@ -146,7 +146,9 @@ class MemoryStore:
         # Semantic recall via Mem0
         if mem0 and query:
             try:
-                results = mem0.search(query, user_id=_MEM0_USER, limit=self._mem0_config.search_limit)
+                raw = mem0.search(query, user_id=_MEM0_USER, limit=self._mem0_config.search_limit)
+                # Mem0 returns {"results": [...]} in newer versions, plain list in older
+                results = raw.get("results", raw) if isinstance(raw, dict) else raw
                 facts = [r["memory"] for r in results if r.get("memory")]
                 if facts:
                     parts.append("## Recalled Memories\n" + "\n".join(f"- {f}" for f in facts))
