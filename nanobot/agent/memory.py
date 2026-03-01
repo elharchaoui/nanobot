@@ -303,7 +303,7 @@ class MemoryStore:
         snippets = [
             m["content"][:80]
             for m in messages
-            if m.get("role") == "user" and m.get("content")
+            if m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"]
         ]
         topics = "; ".join(snippets[:3])
         entry = f"[{ts}] Processed {len(messages)} messages. User topics: {topics}"
