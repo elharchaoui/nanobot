@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -72,7 +73,12 @@ class MemoryStore:
             return None
         try:
             from mem0 import Memory  # type: ignore[import]
-            self._mem0 = Memory.from_config(self._build_mem0_config())
+            cfg = self._build_mem0_config()
+            # Trigger Mem0's native OpenRouter path so calls appear in the dashboard
+            c = self._mem0_config
+            if c.llm_api_key and c.llm_base_url and "openrouter" in c.llm_base_url.lower():
+                os.environ.setdefault("OPENROUTER_API_KEY", c.llm_api_key)
+            self._mem0 = Memory.from_config(cfg)
             logger.info("Mem0 initialized (chroma at {})", self.memory_dir / "chroma")
             return self._mem0
         except ImportError:
@@ -100,7 +106,8 @@ class MemoryStore:
             if c.llm_api_key:
                 llm_cfg["api_key"] = c.llm_api_key
             if c.llm_base_url:
-                llm_cfg["openai_base_url"] = c.llm_base_url
+                key = "openrouter_base_url" if "openrouter" in c.llm_base_url.lower() else "openai_base_url"
+                llm_cfg[key] = c.llm_base_url
             cfg["llm"] = {"provider": c.llm_provider, "config": llm_cfg}
         if c.embedder_provider:
             emb_cfg: dict = {}
