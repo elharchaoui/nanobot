@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
-from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -447,7 +446,7 @@ class AgentLoop:
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        return await MemoryStore(self.workspace, mem0_config=self._mem0_config).consolidate(
+        return await self.context.memory.consolidate(
             session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
         )
