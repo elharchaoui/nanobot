@@ -202,7 +202,7 @@ class MemoryStore:
         chat_messages = [
             {"role": m["role"], "content": m["content"]}
             for m in old_messages
-            if m.get("content") and m.get("role") in ("user", "assistant")
+            if isinstance(m.get("content"), str) and m["content"] and m.get("role") in ("user", "assistant")
         ]
         if chat_messages:
             try:
