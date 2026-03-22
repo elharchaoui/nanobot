@@ -81,6 +81,12 @@ uv tool install --reinstall /root/projects/nanobot
 sudo systemctl restart nanobot
 ```
 
+> **Note:** `--reinstall` rebuilds from scratch and drops optional extras. If you have any enabled (e.g. `mem0`), include them explicitly:
+> ```bash
+> uv tool install --reinstall '/root/projects/nanobot[mem0]'
+> sudo systemctl restart nanobot
+> ```
+
 ### After editing config only (`~/.nanobot/config.json`)
 
 No reinstall needed — just restart:

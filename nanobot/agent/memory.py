@@ -238,6 +238,9 @@ class MemoryStore:
             for m in messages
             if isinstance(m.get("content"), str) and m["content"] and m.get("role") in ("user", "assistant")
         ]
+        # Anthropic requires conversations to end with a user message
+        while chat_messages and chat_messages[-1]["role"] == "assistant":
+            chat_messages.pop()
         if chat_messages:
             try:
                 await asyncio.get_event_loop().run_in_executor(
