@@ -105,6 +105,8 @@ class WebSearchTool(Tool):
             return await self._search_jina(query, n)
         elif provider == "brave":
             return await self._search_brave(query, n)
+        elif provider == "exa":
+            return await self._search_exa(query, n)
         else:
             return f"Error: unknown search provider '{provider}'"
 
@@ -210,6 +212,29 @@ class WebSearchTool(Tool):
         except Exception as e:
             logger.warning("DuckDuckGo search failed: {}", e)
             return f"Error: DuckDuckGo search failed ({e})"
+
+    async def _search_exa(self, query: str, n: int) -> str:
+        api_key = self.config.exa_api_key or self.config.api_key or os.environ.get("EXA_API_KEY", "")
+        if not api_key:
+            logger.warning("EXA_API_KEY not set, falling back to DuckDuckGo")
+            return await self._search_duckduckgo(query, n)
+        try:
+            async with httpx.AsyncClient(proxy=self.proxy) as client:
+                r = await client.post(
+                    "https://api.exa.ai/search",
+                    headers={"x-api-key": api_key, "Content-Type": "application/json"},
+                    json={"query": query, "numResults": n, "type": "neural", "contents": {"text": {"maxCharacters": 1000}}},
+                    timeout=15.0,
+                )
+                r.raise_for_status()
+            items = [
+                {"title": x.get("title", ""), "url": x.get("url", ""), "content": (x.get("text") or x.get("snippet") or "")}
+                for x in r.json().get("results", [])
+            ]
+            return _format_results(query, items, n)
+        except Exception as e:
+            logger.warning("Exa search failed: {}", e)
+            return f"Error: Exa search failed ({e})"
 
 
 class WebFetchTool(Tool):
