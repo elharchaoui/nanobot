@@ -163,6 +163,27 @@ class ModelPresetConfig(RequestOverrides):
         )
 
 
+class Mem0Config(Base):
+    """Mem0 semantic memory (fork-only). Requires a manual ``pip install mem0ai``."""
+
+    enabled: bool = False
+    llm_provider: str = "openai"
+    llm_model: str = ""
+    llm_api_key: str = Field(default="", repr=False)
+    llm_base_url: str = ""
+    embedder_provider: str = "openai"
+    embedder_model: str = "text-embedding-3-small"
+    embedder_api_key: str = Field(default="", repr=False)
+    embedder_base_url: str = ""
+    search_limit: int = 10
+
+
+class MemoryConfig(Base):
+    """Memory backend configuration (fork-only)."""
+
+    mem0: Mem0Config = Field(default_factory=Mem0Config)
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -206,6 +227,7 @@ class AgentDefaults(Base):
         ge=0,
     )
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)  # fork: mem0
 
     @model_validator(mode="before")
     @classmethod
