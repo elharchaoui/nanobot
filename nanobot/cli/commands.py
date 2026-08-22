@@ -1064,10 +1064,7 @@ def _run_gateway(
         except Exception as e:
             console.print(f"[yellow]Could not open browser ({e}); visit {open_browser_url}[/yellow]")
 
-    crashed = False
-
     async def run():
-        nonlocal crashed
         try:
             await cron.start()
             await heartbeat.start()
@@ -1086,7 +1083,6 @@ def _run_gateway(
 
             console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
             console.print(traceback.format_exc())
-            crashed = True
         finally:
             await agent.close_mcp()
             heartbeat.stop()
@@ -1101,8 +1097,6 @@ def _run_gateway(
                 logger.info("Shutdown: flushed {} session(s) to disk", flushed)
 
     asyncio.run(run())
-    if crashed:
-        raise typer.Exit(1)
 
 
 # ============================================================================
