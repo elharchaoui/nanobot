@@ -32,6 +32,9 @@ from nanobot.utils.prompt_templates import render_template
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import SessionManager
+    from nanobot.config.schema import Mem0Config
+
+_MEM0_USER = "owner"
 
 
 # ---------------------------------------------------------------------------
@@ -48,9 +51,11 @@ class MemoryStore:
         r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s+[A-Z][A-Z0-9_]*(?:\s+\[tools:\s*[^\]]+\])?:"
     )
 
-    def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
+    def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY, mem0_config: "Mem0Config | None" = None):
         self.workspace = workspace
         self.max_history_entries = max_history_entries
+        self._mem0_config = mem0_config
+        self._mem0 = None
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "history.jsonl"
@@ -69,6 +74,77 @@ class MemoryStore:
     @property
     def git(self) -> GitStore:
         return self._git
+
+    # -- Mem0 helpers --------------------------------------------------------
+
+    def _get_mem0(self):
+        """Lazy-initialize and return the Mem0 client, or None if disabled/unavailable."""
+        if self._mem0 is not None:
+            return self._mem0
+        if not self._mem0_config or not self._mem0_config.enabled:
+            return None
+        try:
+            from mem0 import Memory  # type: ignore[import]
+            cfg = self._build_mem0_config()
+            self._mem0 = Memory.from_config(cfg)
+            logger.info("Mem0 initialized (chroma at {})", self.memory_dir / "chroma")
+            return self._mem0
+        except ImportError:
+            logger.warning("mem0ai is not installed — run: pip install 'nanobot-ai[mem0]'")
+        except Exception:
+            logger.exception("Mem0 initialization failed")
+        return None
+
+    def _build_mem0_config(self) -> dict:
+        c = self._mem0_config
+        cfg: dict = {
+            "vector_store": {"provider": "chroma", "config": {"collection_name": "nanobot", "path": str(self.memory_dir / "chroma")}},
+            "llm": {"provider": c.llm_provider, "config": {"model": c.llm_model or "gpt-4o-mini"}},
+            "embedder": {"provider": c.embedder_provider, "config": {"model": c.embedder_model}},
+        }
+        if c.llm_api_key:
+            cfg["llm"]["config"]["api_key"] = c.llm_api_key
+        if c.llm_base_url:
+            cfg["llm"]["config"]["base_url"] = c.llm_base_url
+        if c.embedder_api_key:
+            cfg["embedder"]["config"]["api_key"] = c.embedder_api_key
+        if c.embedder_base_url:
+            cfg["embedder"]["config"]["base_url"] = c.embedder_base_url
+        return cfg
+
+    async def consolidate_via_mem0(self, messages: list[dict]) -> bool:
+        """Extract facts into ChromaDB via Mem0 and append a history log entry."""
+        mem0 = self._get_mem0()
+        if not mem0:
+            return False
+        chat_messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in messages
+            if isinstance(m.get("content"), str) and m["content"] and m.get("role") in ("user", "assistant")
+        ]
+        # Anthropic requires conversations to end with a user message
+        while chat_messages and chat_messages[-1]["role"] == "assistant":
+            chat_messages.pop()
+        if chat_messages:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: mem0.add(chat_messages, user_id=_MEM0_USER),
+                )
+                logger.info("Mem0: extracted facts from {} messages", len(chat_messages))
+            except Exception:
+                logger.exception("Mem0 add failed")
+                return False
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        snippets = [
+            m["content"][:80]
+            for m in messages
+            if m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"]
+        ]
+        topics = "; ".join(snippets[:3])
+        self.append_history(f"[{ts}] Processed {len(messages)} messages. User topics: {topics}")
+        logger.info("Mem0 consolidation done for {} messages", len(messages))
+        return True
 
     # -- generic helpers -----------------------------------------------------
 
@@ -633,12 +709,14 @@ class Consolidator:
             return truncate_text(text, budget * 4)
 
     async def archive(self, messages: list[dict]) -> str | None:
-        """Summarize messages via LLM and append to history.jsonl.
+        """Summarize messages via LLM (or mem0) and append to history.jsonl.
 
         Returns the summary text on success, None if nothing to archive.
         """
         if not messages:
             return None
+        if await self.store.consolidate_via_mem0(messages):
+            return "[mem0]"
         try:
             formatted = MemoryStore._format_messages(messages)
             formatted = self._truncate_to_token_budget(formatted)
