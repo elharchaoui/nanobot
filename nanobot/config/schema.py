@@ -75,6 +75,27 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class Mem0Config(Base):
+    """Mem0 memory backend configuration."""
+
+    enabled: bool = False
+    llm_provider: str = "openai"
+    llm_model: str = ""
+    llm_api_key: str = ""
+    llm_base_url: str = ""
+    embedder_provider: str = "openai"
+    embedder_model: str = "text-embedding-3-small"
+    embedder_api_key: str = ""
+    embedder_base_url: str = ""
+    search_limit: int = 10
+
+
+class MemoryConfig(Base):
+    """Memory system configuration."""
+
+    mem0: Mem0Config = Field(default_factory=Mem0Config)
+
+
 class InlineFallbackConfig(Base):
     """One inline fallback model configuration."""
 
@@ -158,6 +179,7 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
 
 class AgentsConfig(Base):
