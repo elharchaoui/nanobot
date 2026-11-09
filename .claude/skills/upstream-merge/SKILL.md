@@ -143,6 +143,13 @@ Re-add: `ContextBuilder(..., mem0_config=None)` → `MemoryStore(workspace, mem0
 
 ### Environment after merge
 
+**DANGER — always run the test suite with an isolated HOME:**
+`HOME=$(mktemp -d) .venv/bin/python -m pytest ...`
+The repo's conftest does not isolate HOME, and `Config()` defaults its workspace to
+the real `~/.nanobot/workspace`. On 2026-11-09 a full test run migrated the live
+gateway's `workspace/sessions/*.jsonl` into a pytest temp dir, which pytest later
+deleted — the main bot's session transcripts were lost (long-term memory survived).
+
 Upstream adds dependencies often: `VIRTUAL_ENV=.venv uv pip install -e ".[dev]"` before
 running smoke tests. Known env-only test failures (also fail on pristine upstream):
 Matrix optional deps, `tests/test_update*.py` (system python lacks ensurepip).
