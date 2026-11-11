@@ -91,7 +91,7 @@ class MyTool(Tool):
     })
 
     RESTRICTED: dict[str, dict[str, Any]] = {
-        "max_iterations":        {"type": int, "min": 1,   "max": 100},
+        "max_iterations":        {"type": int, "min": 1,   "max": 200},
         "context_window_tokens": {"type": int, "min": 4096, "max": 1_000_000},
         "model":                 {"type": str, "min_len": 1},
     }
