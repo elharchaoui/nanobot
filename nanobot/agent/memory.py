@@ -46,7 +46,10 @@ from nanobot.utils.workspace_prompts import (
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.registry import ToolRegistry
+    from nanobot.config.schema import Mem0Config
     from nanobot.utils.llm_runtime import LLMRuntime
+
+_MEM0_USER = "owner"
 
 
 class MemoryStore:
@@ -63,9 +66,17 @@ class MemoryStore:
         r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s+[A-Z][A-Z0-9_]*(?:\s+\[tools:\s*[^\]]+\])?:"
     )
 
-    def __init__(self, workspace: Path, max_history_entries: int = _DEFAULT_MAX_HISTORY):
+    def __init__(
+        self,
+        workspace: Path,
+        max_history_entries: int = _DEFAULT_MAX_HISTORY,
+        mem0_config: Mem0Config | None = None,
+    ):
         self.workspace = workspace
         self.max_history_entries = max_history_entries
+        self._mem0_config = mem0_config
+        self._mem0: Any = None
+        self._mem0_tasks: set[asyncio.Task[bool]] = set()
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "history.jsonl"
@@ -87,6 +98,91 @@ class MemoryStore:
     @property
     def git(self) -> GitStore:
         return self._git
+
+    # -- Mem0 helpers (fork-only) --------------------------------------------
+
+    def _get_mem0(self) -> Any:
+        """Lazy-initialize and return the Mem0 client, or None if disabled/unavailable."""
+        if self._mem0 is not None:
+            return self._mem0
+        if not self._mem0_config or not self._mem0_config.enabled:
+            return None
+        try:
+            from mem0 import Memory  # type: ignore[import]
+            self._mem0 = Memory.from_config(self._build_mem0_config())
+            logger.info("Mem0 initialized (chroma at {})", self.memory_dir / "chroma")
+            return self._mem0
+        except ImportError:
+            logger.warning("mem0ai is not installed — run: pip install mem0ai")
+        except Exception:
+            logger.exception("Mem0 initialization failed")
+        return None
+
+    def _build_mem0_config(self) -> dict[str, Any]:
+        c = self._mem0_config
+        assert c is not None
+        cfg: dict[str, Any] = {
+            "vector_store": {
+                "provider": "chroma",
+                "config": {"collection_name": "nanobot", "path": str(self.memory_dir / "chroma")},
+            },
+            "llm": {"provider": c.llm_provider, "config": {"model": c.llm_model or "gpt-4o-mini"}},
+            "embedder": {"provider": c.embedder_provider, "config": {"model": c.embedder_model}},
+        }
+        if c.llm_api_key:
+            cfg["llm"]["config"]["api_key"] = c.llm_api_key
+        if c.llm_base_url:
+            # mem0ai's provider-specific config classes key the override as
+            # e.g. "openai_base_url" / "ollama_base_url", not a generic "base_url".
+            cfg["llm"]["config"][f"{c.llm_provider}_base_url"] = c.llm_base_url
+        if c.embedder_api_key:
+            cfg["embedder"]["config"]["api_key"] = c.embedder_api_key
+        if c.embedder_base_url:
+            cfg["embedder"]["config"][f"{c.embedder_provider}_base_url"] = c.embedder_base_url
+        return cfg
+
+    async def consolidate_via_mem0(self, messages: list[dict[str, Any]]) -> bool:
+        """Extract facts from *messages* into ChromaDB via Mem0. Returns True on success."""
+        mem0 = self._get_mem0()
+        if not mem0:
+            return False
+        # Skip multimodal (non-string) content and non-chat roles.
+        chat_messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in messages
+            if isinstance(m.get("content"), str)
+            and m["content"]
+            and m.get("role") in ("user", "assistant")
+        ]
+        # Anthropic requires conversations to end with a user message
+        while chat_messages and chat_messages[-1]["role"] == "assistant":
+            chat_messages.pop()
+        if not chat_messages:
+            return True
+        try:
+            await asyncio.to_thread(mem0.add, chat_messages, user_id=_MEM0_USER)
+        except Exception:
+            logger.exception("Mem0 add failed")
+            return False
+        logger.info("Mem0: extracted facts from {} messages", len(chat_messages))
+        return True
+
+    def schedule_mem0_consolidation(self, messages: list[dict[str, Any]]) -> None:
+        """Run Mem0 fact extraction in the background without blocking compaction.
+
+        Mem0 is write-only here: upstream's archive summary still becomes the
+        session checkpoint, so Mem0 must never replace it.
+        """
+        if not self._mem0_config or not self._mem0_config.enabled:
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(
+                self.consolidate_via_mem0([dict(m) for m in messages])
+            )
+        except RuntimeError:
+            return
+        self._mem0_tasks.add(task)
+        task.add_done_callback(self._mem0_tasks.discard)
 
 
     @staticmethod
@@ -797,6 +893,8 @@ class MemoryArchiver:
         """Generate a replacement checkpoint and optionally persist it."""
         if not source_messages:
             return None
+        if persist:
+            self.store.schedule_mem0_consolidation(source_messages)  # fork: mem0
 
         def raw_fallback() -> str:
             return self._raw_checkpoint(
